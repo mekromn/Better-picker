@@ -9,6 +9,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      BETTER_PICKER_CERT_SHA256: 7c92f4984297a336356581d46e1e0674c7117fae800df42257d7823f8998fcaf
     steps:
       - uses: actions/checkout@v4
 
@@ -22,8 +24,8 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      # Keep one private debug signing identity for this repository across CI runners.
-      # The key itself never lives in git or in the downloadable APK artifact.
+      # One persistent private signing identity for this repository.
+      # It lives only in the repository-scoped Actions cache, never in git or APK artifacts.
       - name: Restore Better Picker signing key
         id: signing-key-cache
         uses: actions/cache@v4
@@ -47,22 +49,34 @@ jobs:
             -validity 10000
           chmod 600 "$HOME/.android/debug.keystore"
 
-      - name: Print signing certificate fingerprint
+      - name: Verify cached signing key identity
         shell: bash
         run: |
-          keytool -list -v \
+          ACTUAL="$(keytool -list -v \
             -keystore "$HOME/.android/debug.keystore" \
             -storepass android \
-            -alias androiddebugkey | grep 'SHA256:'
+            -alias androiddebugkey \
+            | sed -n 's/.*SHA256: //p' \
+            | tr -d ':' \
+            | tr '[:upper:]' '[:lower:]')"
+          echo "Keystore certificate SHA-256: $ACTUAL"
+          test "$ACTUAL" = "$BETTER_PICKER_CERT_SHA256"
 
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
 
-      - name: Verify APK signer
+      - name: Verify APK signer identity
         shell: bash
         run: |
           APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
-          "$APKSIGNER" verify --print-certs app/build/outputs/apk/debug/app-debug.apk
+          OUTPUT="$("$APKSIGNER" verify --print-certs app/build/outputs/apk/debug/app-debug.apk)"
+          echo "$OUTPUT"
+          ACTUAL="$(printf '%s\n' "$OUTPUT" \
+            | sed -n 's/.*certificate SHA-256 digest: //p' \
+            | head -n 1 \
+            | tr '[:upper:]' '[:lower:]')"
+          echo "APK certificate SHA-256: $ACTUAL"
+          test "$ACTUAL" = "$BETTER_PICKER_CERT_SHA256"
 
       - uses: actions/upload-artifact@v4
         with:
