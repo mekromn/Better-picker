@@ -15,6 +15,8 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import java.text.DateFormat;
+import java.util.Date;
 import java.util.List;
 
 public final class MainActivity extends Activity {
@@ -44,7 +46,7 @@ public final class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = text(
-                "Automatically switches Android DocumentsUI to Modified sorting when the picker opens.",
+                "Automatically switches Android DocumentsUI to Modified (newest first) when the picker opens.",
                 16, Color.rgb(189, 193, 198));
         subtitle.setGravity(Gravity.CENTER);
         LinearLayout.LayoutParams subLp = new LinearLayout.LayoutParams(
@@ -73,7 +75,7 @@ public final class MainActivity extends Activity {
         root.addView(settings, buttonLp);
 
         TextView note = text(
-                "No overlay. No storage permission. No network permission. It only clicks DocumentsUI's native Sort by → By date modified controls once when a picker window appears.",
+                "No overlay, storage permission, network permission, or navigation control. On Pixel Android 16 it uses the native More options → Sort by… → Modified (newest first) controls.",
                 14, Color.rgb(154, 160, 166));
         note.setGravity(Gravity.CENTER);
         LinearLayout.LayoutParams noteLp = new LinearLayout.LayoutParams(
@@ -86,9 +88,20 @@ public final class MainActivity extends Activity {
 
     private void updateStatus() {
         boolean enabled = isServiceEnabled();
-        status.setText(enabled
+        long lastSuccess = getSharedPreferences("runtime", MODE_PRIVATE)
+                .getLong("last_success_ms", 0L);
+
+        StringBuilder value = new StringBuilder(enabled
                 ? "Modified sort automation  ON ✓"
                 : "Modified sort automation  OFF");
+        value.append("\n\nLast successful change: ");
+        if (lastSuccess == 0L) {
+            value.append("never");
+        } else {
+            value.append(DateFormat.getDateTimeInstance(
+                    DateFormat.SHORT, DateFormat.MEDIUM).format(new Date(lastSuccess)));
+        }
+        status.setText(value.toString());
     }
 
     private boolean isServiceEnabled() {
