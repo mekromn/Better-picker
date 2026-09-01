@@ -43,7 +43,8 @@ public final class BetterPickerAccessibilityService extends AccessibilityService
         if (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             CharSequence clsCs = event.getClassName();
             String cls = clsCs == null ? "" : clsCs.toString();
-            if (isPickerClass(cls) && event.getWindowId() != pickerWindowId) {
+            if (isPickerClass(cls)
+                    && (phase == IDLE || event.getWindowId() != pickerWindowId)) {
                 pickerWindowId = event.getWindowId();
                 phase = WAITING_SORT;
                 retryStep = 0;
@@ -80,10 +81,8 @@ public final class BetterPickerAccessibilityService extends AccessibilityService
             if (click(sort)) {
                 phase = WAITING_MODIFIED;
                 retryStep = 0;
-                scheduleRetry();
-            } else {
-                scheduleRetry();
             }
+            scheduleRetry();
             return;
         }
 
@@ -167,7 +166,8 @@ public final class BetterPickerAccessibilityService extends AccessibilityService
             }
         }
         for (int i = 0; i < root.getChildCount(); i++) {
-            AccessibilityNodeInfo hit = findByText(root.getChild(i), labels);
+            AccessibilityNodeInfo child = root.getChild(i);
+            AccessibilityNodeInfo hit = child == null ? null : findByText(child, labels);
             if (hit != null) return hit;
         }
         return null;
