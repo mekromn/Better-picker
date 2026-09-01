@@ -1,153 +1,198 @@
 package com.mekromn.betterpicker;
 
 import android.accessibilityservice.AccessibilityService;
-import android.graphics.PixelFormat;
-import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
-import android.view.Gravity;
-import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
-import android.widget.Toast;
 
-import java.io.File;
+import java.util.List;
 
-public final class BetterPickerAccessibilityService extends AccessibilityService
-        implements LocalFileBrowserView.Listener {
+public final class BetterPickerAccessibilityService extends AccessibilityService {
+    private static final int IDLE = 0;
+    private static final int WAITING_SORT = 1;
+    private static final int WAITING_MODIFIED = 2;
+    private static final int APPLIED = 3;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private WindowManager windowManager;
-    private LocalFileBrowserView overlay;
-    private PickerMode activeMode = PickerMode.OPEN;
-    private boolean handoffInProgress;
-    private long lastPickerEventMs;
+    private int pickerWindowId = -1;
+    private int phase = IDLE;
+    private int generation;
+    private int retryStep;
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
-        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+        resetSession();
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (event == null) return;
+
+        if (event.getEventType() == AccessibilityEvent.TYPE_WINDOWS_CHANGED
+                && (event.getWindowChanges() & AccessibilityEvent.WINDOWS_CHANGE_REMOVED) != 0
+                && event.getWindowId() == pickerWindowId) {
+            resetSession();
+            return;
+        }
+
         CharSequence pkgCs = event.getPackageName();
-        CharSequence clsCs = event.getClassName();
-        if (pkgCs == null || clsCs == null) return;
+        if (pkgCs == null || !isDocumentsUi(pkgCs.toString())) return;
 
-        String pkg = pkgCs.toString();
-        String cls = clsCs.toString();
-        if (!isDocumentsUi(pkg) || !isPickerClass(cls)) return;
-        if (handoffInProgress || overlay != null) return;
+        if (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            CharSequence clsCs = event.getClassName();
+            String cls = clsCs == null ? "" : clsCs.toString();
+            if (isPickerClass(cls) && event.getWindowId() != pickerWindowId) {
+                pickerWindowId = event.getWindowId();
+                phase = WAITING_SORT;
+                retryStep = 0;
+                generation++;
+                tryAdvance();
+                return;
+            }
+        }
 
-        long now = android.os.SystemClock.uptimeMillis();
-        if (now - lastPickerEventMs < 250) return;
-        lastPickerEventMs = now;
-        handler.postDelayed(this::captureModeAndShow, 140);
+        if (phase == WAITING_SORT || phase == WAITING_MODIFIED) {
+            tryAdvance();
+        }
     }
 
     @Override
     public void onInterrupt() {
-        removeOverlay();
+        resetSession();
     }
 
-    @Override
-    public void onDestroy() {
-        removeOverlay();
-        super.onDestroy();
-    }
-
-    private boolean isDocumentsUi(String pkg) {
-        return "com.android.documentsui".equals(pkg)
-                || "com.google.android.documentsui".equals(pkg)
-                || pkg.endsWith(".documentsui");
-    }
-
-    private boolean isPickerClass(String cls) {
-        return cls.contains("picker.PickActivity")
-                || cls.endsWith(".DocumentsActivity");
-    }
-
-    private void captureModeAndShow() {
-        if (overlay != null || handoffInProgress) return;
+    private void tryAdvance() {
         AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) return;
-
-        activeMode = detectMode(root);
-        if (!Environment.isExternalStorageManager()) {
-            Toast.makeText(this,
-                    "Better Picker needs All files access. Open the Better Picker app to grant it.",
-                    Toast.LENGTH_LONG).show();
+        if (root == null) {
+            scheduleRetry();
+            return;
         }
-        showOverlay(activeMode);
-    }
 
-    private PickerMode detectMode(AccessibilityNodeInfo root) {
-        if (DocumentUiDriver.treeContainsText(root, "Use this folder")) {
-            return PickerMode.TREE;
+        if (phase == WAITING_SORT) {
+            AccessibilityNodeInfo sort = firstById(root,
+                    "com.google.android.documentsui:id/menu_sort",
+                    "com.android.documentsui:id/menu_sort");
+            if (sort == null) {
+                sort = findByText(root, "Sort by", "Sort");
+            }
+            if (click(sort)) {
+                phase = WAITING_MODIFIED;
+                retryStep = 0;
+                scheduleRetry();
+            } else {
+                scheduleRetry();
+            }
+            return;
         }
-        if (DocumentUiDriver.hasEditableNode(root)
-                && (DocumentUiDriver.treeContainsText(root, "Save")
-                || DocumentUiDriver.treeContainsText(root, "Create"))) {
-            return PickerMode.CREATE;
-        }
-        return PickerMode.OPEN;
-    }
 
-    private void showOverlay(PickerMode mode) {
-        if (windowManager == null || overlay != null) return;
-        overlay = new LocalFileBrowserView(this, mode, this);
-
-        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.OPAQUE);
-        lp.gravity = Gravity.TOP | Gravity.START;
-        lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE;
-        windowManager.addView(overlay, lp);
-    }
-
-    private void removeOverlay() {
-        if (overlay != null && windowManager != null) {
-            try {
-                windowManager.removeViewImmediate(overlay);
-            } catch (Exception ignored) { }
-            overlay = null;
+        if (phase == WAITING_MODIFIED) {
+            AccessibilityNodeInfo modified = firstById(root,
+                    "com.google.android.documentsui:id/menu_sort_date",
+                    "com.android.documentsui:id/menu_sort_date");
+            if (modified == null) {
+                modified = findByText(root,
+                        "By date modified", "Date modified", "Modified");
+            }
+            if (click(modified)) {
+                phase = APPLIED;
+                retryStep = 0;
+                generation++;
+            } else {
+                scheduleRetry();
+            }
         }
     }
 
-    private void beginHandoff(DocumentUiDriver.Action action) {
-        removeOverlay();
-        handoffInProgress = true;
+    private void scheduleRetry() {
+        if (phase == APPLIED || retryStep >= 7) return;
+        final int expectedGeneration = generation;
+        final int step = retryStep++;
+        final long delayMs;
+        switch (step) {
+            case 0: delayMs = 16; break;
+            case 1: delayMs = 24; break;
+            case 2: delayMs = 40; break;
+            case 3: delayMs = 64; break;
+            case 4: delayMs = 96; break;
+            case 5: delayMs = 144; break;
+            default: delayMs = 220; break;
+        }
         handler.postDelayed(() -> {
-            DocumentUiDriver driver = new DocumentUiDriver(this, () -> {
-                handoffInProgress = false;
-            });
-            action.run(driver);
-        }, 220);
+            if (generation == expectedGeneration
+                    && (phase == WAITING_SORT || phase == WAITING_MODIFIED)) {
+                tryAdvance();
+            }
+        }, delayMs);
     }
 
-    @Override
-    public void onFileSelected(File file) {
-        beginHandoff(driver -> driver.selectFile(file));
+    private static boolean isDocumentsUi(String pkg) {
+        return "com.google.android.documentsui".equals(pkg)
+                || "com.android.documentsui".equals(pkg);
     }
 
-    @Override
-    public void onFolderSelected(File folder) {
-        beginHandoff(driver -> driver.selectFolder(folder));
+    private static boolean isPickerClass(String cls) {
+        return cls.contains("PickActivity")
+                || cls.endsWith("DocumentsActivity")
+                || cls.contains(".picker.");
     }
 
-    @Override
-    public void onCreateFile(File folder, String displayName) {
-        beginHandoff(driver -> driver.createFile(folder, displayName));
+    private static AccessibilityNodeInfo firstById(
+            AccessibilityNodeInfo root, String... ids) {
+        for (String id : ids) {
+            try {
+                List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByViewId(id);
+                if (nodes != null) {
+                    for (AccessibilityNodeInfo node : nodes) {
+                        if (node != null && node.isVisibleToUser() && node.isEnabled()) {
+                            return clickableAncestor(node);
+                        }
+                    }
+                }
+            } catch (RuntimeException ignored) { }
+        }
+        return null;
     }
 
-    @Override
-    public void onCancel() {
-        removeOverlay();
-        performGlobalAction(GLOBAL_ACTION_BACK);
+    private static AccessibilityNodeInfo findByText(
+            AccessibilityNodeInfo root, String... labels) {
+        if (root == null) return null;
+        CharSequence text = root.getText();
+        CharSequence desc = root.getContentDescription();
+        for (String label : labels) {
+            if ((text != null && label.contentEquals(text))
+                    || (desc != null && label.contentEquals(desc))) {
+                return clickableAncestor(root);
+            }
+        }
+        for (int i = 0; i < root.getChildCount(); i++) {
+            AccessibilityNodeInfo hit = findByText(root.getChild(i), labels);
+            if (hit != null) return hit;
+        }
+        return null;
+    }
+
+    private static AccessibilityNodeInfo clickableAncestor(AccessibilityNodeInfo node) {
+        AccessibilityNodeInfo current = node;
+        for (int i = 0; current != null && i < 5; i++) {
+            if (current.isClickable() && current.isEnabled()) return current;
+            current = current.getParent();
+        }
+        return node != null && node.isEnabled() ? node : null;
+    }
+
+    private static boolean click(AccessibilityNodeInfo node) {
+        return node != null
+                && node.isEnabled()
+                && node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+    }
+
+    private void resetSession() {
+        pickerWindowId = -1;
+        phase = IDLE;
+        retryStep = 0;
+        generation++;
+        handler.removeCallbacksAndMessages(null);
     }
 }
