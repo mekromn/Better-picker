@@ -3,23 +3,33 @@ package com.mekromn.betterpicker;
 import android.accessibilityservice.AccessibilityService;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 
 import java.util.List;
 
 public final class BetterPickerAccessibilityService extends AccessibilityService {
     private static final int IDLE = 0;
-    private static final int FIND_SORT = 1;
+    private static final int FIND_ENTRY = 1;
     private static final int FIND_SORT_ENTRY = 2;
     private static final int FIND_MODIFIED = 3;
     private static final int APPLIED = 4;
+    private static final int ABORTED = 5;
+
+    // We only touch the picker right as it launches. If DocumentsUI is not ready in this
+    // window, stand down for the entire picker session instead of surprising the user later.
+    private static final long STARTUP_ACTION_WINDOW_MS = 1400;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
+
     private int phase = IDLE;
     private int generation;
-    private int retryStep;
+    private int retryAttempt;
+    private boolean retryScheduled;
     private long sessionStartedMs;
+    private int exitMisses;
 
     @Override
     protected void onServiceConnected() {
@@ -34,15 +44,17 @@ public final class BetterPickerAccessibilityService extends AccessibilityService
         CharSequence pkgCs = event.getPackageName();
         if (pkgCs == null || !isDocumentsUi(pkgCs.toString())) return;
 
-        // Do not depend on a specific activity class. Android 16 has changed picker
-        // internals across builds, while the DocumentsUI package is the stable boundary.
-        if (phase == IDLE || sessionExpired()) {
+        if (phase == IDLE) {
             beginSession();
         }
 
-        if (phase != APPLIED) {
-            tryAdvance();
-        }
+        // APPLIED and ABORTED are hard latches. Once either state is reached, this service
+        // performs zero more clicks until DocumentsUI actually leaves the screen.
+        if (phase == APPLIED || phase == ABORTED) return;
+
+        // Real accessibility events are always the fastest signal. Retry timers are only a
+        // fallback for UI transitions that fail to emit the expected event.
+        tryAdvance();
     }
 
     @Override
@@ -52,63 +64,68 @@ public final class BetterPickerAccessibilityService extends AccessibilityService
 
     private void beginSession() {
         generation++;
-        phase = FIND_SORT;
-        retryStep = 0;
-        sessionStartedMs = android.os.SystemClock.uptimeMillis();
+        phase = FIND_ENTRY;
+        retryAttempt = 0;
+        retryScheduled = false;
+        sessionStartedMs = SystemClock.uptimeMillis();
+        exitMisses = 0;
         handler.removeCallbacksAndMessages(null);
+        tryAdvance();
     }
 
-    private boolean sessionExpired() {
-        return phase != IDLE
-                && android.os.SystemClock.uptimeMillis() - sessionStartedMs > 15000;
+    private boolean startupWindowExpired() {
+        return SystemClock.uptimeMillis() - sessionStartedMs > STARTUP_ACTION_WINDOW_MS;
     }
 
     private void tryAdvance() {
+        if (phase == IDLE || phase == APPLIED || phase == ABORTED) return;
+
+        if (startupWindowExpired()) {
+            abortForSession();
+            return;
+        }
+
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) {
             scheduleRetry();
             return;
         }
 
-        // Modern Android 16 path can land directly in the sorting bottom sheet after
-        // a content event, so always prefer completing the operation if that option exists.
-        AccessibilityNodeInfo modified = findModified(root);
-        if (modified != null && click(modified)) {
-            markApplied();
+        // If DocumentsUI already remembered our desired setting, do absolutely nothing.
+        // Current AOSP exposes this as the accessibility label "Sorted by ...".
+        if (isAlreadyModifiedNewest(root)) {
+            markApplied(false);
             return;
         }
 
-        if (phase == FIND_SORT) {
-            // Older/AOSP layouts may expose Sort by directly in the toolbar.
-            AccessibilityNodeInfo sort = firstById(root,
+        if (phase == FIND_ENTRY) {
+            // Old/AOSP path: Sort by is directly exposed.
+            AccessibilityNodeInfo directSort = firstById(root,
                     "com.google.android.documentsui:id/menu_sort",
                     "com.android.documentsui:id/menu_sort",
                     "com.google.android.documentsui:id/option_menu_sort",
                     "com.android.documentsui:id/option_menu_sort");
-            if (sort == null) {
-                sort = findExact(root,
-                        "Sort by", "Sort by...", "Sort by…");
+            if (directSort == null) {
+                directSort = findExact(root, "Sort by", "Sort by...", "Sort by…");
             }
-            if (click(sort)) {
+            if (click(directSort)) {
                 phase = FIND_MODIFIED;
-                retryStep = 0;
+                retryAttempt = 0;
                 scheduleRetry();
                 return;
             }
 
-            // Pixel Android 16 puts Sort by... inside the three-dot overflow. The
-            // overflow button is exposed to accessibility as "More options".
-            AccessibilityNodeInfo overflow = findExact(root,
-                    "More options", "More options button");
+            // Pixel Android 16 path: Sort by lives inside the overflow menu.
+            AccessibilityNodeInfo overflow = firstById(root,
+                    "com.google.android.documentsui:id/action_menu_overflow",
+                    "com.android.documentsui:id/action_menu_overflow",
+                    "android:id/action_menu_overflow");
             if (overflow == null) {
-                overflow = firstById(root,
-                        "com.google.android.documentsui:id/action_menu_overflow",
-                        "com.android.documentsui:id/action_menu_overflow",
-                        "android:id/action_menu_overflow");
+                overflow = findExact(root, "More options", "More options button");
             }
             if (click(overflow)) {
                 phase = FIND_SORT_ENTRY;
-                retryStep = 0;
+                retryAttempt = 0;
                 scheduleRetry();
                 return;
             }
@@ -118,8 +135,6 @@ public final class BetterPickerAccessibilityService extends AccessibilityService
         }
 
         if (phase == FIND_SORT_ENTRY) {
-            // The overflow popup is a separate accessibility window. Its text is
-            // "Sort by..." in current DocumentsUI.
             AccessibilityNodeInfo sortEntry = findExact(root,
                     "Sort by...", "Sort by…", "Sort by");
             if (sortEntry == null) {
@@ -131,66 +146,147 @@ public final class BetterPickerAccessibilityService extends AccessibilityService
             }
             if (click(sortEntry)) {
                 phase = FIND_MODIFIED;
-                retryStep = 0;
+                retryAttempt = 0;
                 scheduleRetry();
                 return;
             }
+
             scheduleRetry();
             return;
         }
 
         if (phase == FIND_MODIFIED) {
-            // findModified above already tried the modern and legacy labels/IDs.
+            AccessibilityNodeInfo modified = findModifiedNewest(root);
+            if (click(modified)) {
+                markApplied(true);
+                return;
+            }
             scheduleRetry();
         }
     }
 
-    private AccessibilityNodeInfo findModified(AccessibilityNodeInfo root) {
-        AccessibilityNodeInfo node = firstById(root,
+    private AccessibilityNodeInfo findModifiedNewest(AccessibilityNodeInfo root) {
+        // Modern Android 16 exposes the fully explicit direction. Prefer that so we never
+        // accidentally choose "oldest first".
+        AccessibilityNodeInfo node = findExact(root, "Modified (newest first)");
+        if (node != null) return node;
+
+        // Legacy DocumentsUI has one Last Modified menu action whose order is newest first.
+        node = firstById(root,
                 "com.google.android.documentsui:id/menu_sort_date",
                 "com.android.documentsui:id/menu_sort_date");
         if (node != null) return node;
 
-        // Current DocumentsUI sorting bottom sheet terminology first, then legacy.
-        return findExact(root,
-                "Modified (newest first)",
-                "By date modified",
-                "Date modified");
+        return findExact(root, "By date modified", "Date modified");
     }
 
-    private void markApplied() {
+    private boolean isAlreadyModifiedNewest(AccessibilityNodeInfo root) {
+        return treeContains(root,
+                "Sorted by Modified (newest first)",
+                "Sorted by By date modified");
+    }
+
+    private void markApplied(boolean changed) {
         phase = APPLIED;
-        retryStep = 0;
+        retryAttempt = 0;
+        retryScheduled = false;
         generation++;
         handler.removeCallbacksAndMessages(null);
-        getSharedPreferences("runtime", MODE_PRIVATE)
-                .edit()
-                .putLong("last_success_ms", System.currentTimeMillis())
-                .apply();
+
+        if (changed) {
+            getSharedPreferences("runtime", MODE_PRIVATE)
+                    .edit()
+                    .putLong("last_success_ms", System.currentTimeMillis())
+                    .apply();
+        }
+
+        // Passive only: watch for DocumentsUI to disappear so the next picker can get one
+        // fresh startup action. No clicks happen from this point onward.
+        scheduleExitCheck(generation, 300);
+    }
+
+    private void abortForSession() {
+        phase = ABORTED;
+        retryAttempt = 0;
+        retryScheduled = false;
+        generation++;
+        handler.removeCallbacksAndMessages(null);
+        scheduleExitCheck(generation, 300);
     }
 
     private void scheduleRetry() {
-        if (phase == APPLIED || phase == IDLE || retryStep >= 10) return;
-        final int expectedGeneration = generation;
-        final int step = retryStep++;
-        final long delayMs;
-        switch (step) {
-            case 0: delayMs = 8; break;
-            case 1: delayMs = 12; break;
-            case 2: delayMs = 16; break;
-            case 3: delayMs = 24; break;
-            case 4: delayMs = 36; break;
-            case 5: delayMs = 54; break;
-            case 6: delayMs = 80; break;
-            case 7: delayMs = 120; break;
-            case 8: delayMs = 180; break;
-            default: delayMs = 260; break;
+        if (phase == IDLE || phase == APPLIED || phase == ABORTED) return;
+        if (retryScheduled) return;
+        if (startupWindowExpired()) {
+            abortForSession();
+            return;
         }
+
+        final int expectedGeneration = generation;
+        final long delayMs = retryDelay(retryAttempt);
+        retryScheduled = true;
+
         handler.postDelayed(() -> {
-            if (generation == expectedGeneration && phase != APPLIED && phase != IDLE) {
+            if (generation != expectedGeneration) return;
+            retryScheduled = false;
+            retryAttempt++;
+            if (phase != IDLE && phase != APPLIED && phase != ABORTED) {
                 tryAdvance();
             }
         }, delayMs);
+    }
+
+    private static long retryDelay(int attempt) {
+        switch (attempt) {
+            case 0: return 6;
+            case 1: return 10;
+            case 2: return 14;
+            case 3: return 20;
+            case 4: return 28;
+            case 5: return 40;
+            case 6: return 56;
+            case 7: return 80;
+            case 8: return 112;
+            case 9: return 160;
+            default: return 220;
+        }
+    }
+
+    private void scheduleExitCheck(int expectedGeneration, long delayMs) {
+        handler.postDelayed(() -> {
+            if (generation != expectedGeneration
+                    || (phase != APPLIED && phase != ABORTED)) {
+                return;
+            }
+
+            if (isDocumentsUiWindowPresent()) {
+                exitMisses = 0;
+                scheduleExitCheck(expectedGeneration, 450);
+            } else {
+                exitMisses++;
+                // Require two misses so a transient popup/window transition cannot re-arm us.
+                if (exitMisses >= 2) {
+                    resetSession();
+                } else {
+                    scheduleExitCheck(expectedGeneration, 120);
+                }
+            }
+        }, delayMs);
+    }
+
+    private boolean isDocumentsUiWindowPresent() {
+        try {
+            List<AccessibilityWindowInfo> windows = getWindows();
+            if (windows == null) return false;
+            for (AccessibilityWindowInfo window : windows) {
+                if (window == null) continue;
+                AccessibilityNodeInfo root = window.getRoot();
+                if (root == null) continue;
+                CharSequence pkg = root.getPackageName();
+                if (pkg != null && isDocumentsUi(pkg.toString())) return true;
+            }
+        } catch (RuntimeException ignored) { }
+        return false;
     }
 
     private static boolean isDocumentsUi(String pkg) {
@@ -205,12 +301,11 @@ public final class BetterPickerAccessibilityService extends AccessibilityService
         for (String id : ids) {
             try {
                 List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByViewId(id);
-                if (nodes != null) {
-                    for (AccessibilityNodeInfo node : nodes) {
-                        if (node != null && node.isVisibleToUser() && node.isEnabled()) {
-                            AccessibilityNodeInfo clickable = clickableAncestor(node);
-                            if (clickable != null) return clickable;
-                        }
+                if (nodes == null) continue;
+                for (AccessibilityNodeInfo node : nodes) {
+                    if (node != null && node.isVisibleToUser() && node.isEnabled()) {
+                        AccessibilityNodeInfo clickable = clickableAncestor(node);
+                        if (clickable != null && clickable.isVisibleToUser()) return clickable;
                     }
                 }
             } catch (RuntimeException ignored) { }
@@ -221,21 +316,38 @@ public final class BetterPickerAccessibilityService extends AccessibilityService
     private static AccessibilityNodeInfo findExact(
             AccessibilityNodeInfo root, String... labels) {
         if (root == null) return null;
+
         CharSequence text = root.getText();
         CharSequence desc = root.getContentDescription();
         for (String label : labels) {
             if ((text != null && label.contentEquals(text))
                     || (desc != null && label.contentEquals(desc))) {
                 AccessibilityNodeInfo clickable = clickableAncestor(root);
-                if (clickable != null) return clickable;
+                if (clickable != null && clickable.isVisibleToUser()) return clickable;
             }
         }
+
         for (int i = 0; i < root.getChildCount(); i++) {
-            AccessibilityNodeInfo child = root.getChild(i);
-            AccessibilityNodeInfo hit = findExact(child, labels);
+            AccessibilityNodeInfo hit = findExact(root.getChild(i), labels);
             if (hit != null) return hit;
         }
         return null;
+    }
+
+    private static boolean treeContains(AccessibilityNodeInfo root, String... needles) {
+        if (root == null) return false;
+        CharSequence text = root.getText();
+        CharSequence desc = root.getContentDescription();
+        for (String needle : needles) {
+            if ((text != null && text.toString().contains(needle))
+                    || (desc != null && desc.toString().contains(needle))) {
+                return true;
+            }
+        }
+        for (int i = 0; i < root.getChildCount(); i++) {
+            if (treeContains(root.getChild(i), needles)) return true;
+        }
+        return false;
     }
 
     private static AccessibilityNodeInfo clickableAncestor(AccessibilityNodeInfo node) {
@@ -244,19 +356,22 @@ public final class BetterPickerAccessibilityService extends AccessibilityService
             if (current.isClickable() && current.isEnabled()) return current;
             current = current.getParent();
         }
-        return node != null && node.isEnabled() ? node : null;
+        return null;
     }
 
     private static boolean click(AccessibilityNodeInfo node) {
         return node != null
+                && node.isVisibleToUser()
                 && node.isEnabled()
                 && node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
     }
 
     private void resetSession() {
         phase = IDLE;
-        retryStep = 0;
+        retryAttempt = 0;
+        retryScheduled = false;
         sessionStartedMs = 0;
+        exitMisses = 0;
         generation++;
         handler.removeCallbacksAndMessages(null);
     }
