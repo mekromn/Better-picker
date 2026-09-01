@@ -1,58 +1,45 @@
 # Better Picker
 
-A rootless Android file-picker takeover prototype.
+Better Picker is a tiny rootless Android accessibility helper for the stock Android DocumentsUI file picker.
 
-## Why it is built this way
+## What it does
 
-Android reserves Storage Access Framework actions such as `ACTION_OPEN_DOCUMENT`,
-`ACTION_CREATE_DOCUMENT`, and `ACTION_OPEN_DOCUMENT_TREE` for the system DocumentsUI.
-A normal third-party APK cannot become the actual SAF broker.
+When DocumentsUI first appears, Better Picker immediately selects the native:
 
-Better Picker therefore uses two paths:
+**Sort by → By date modified**
 
-1. **Direct mode** for `ACTION_GET_CONTENT` / generic `ACTION_PICK`: Better Picker handles
-   the intent itself and returns a grantable `content://` URI from its own provider.
-2. **SAF takeover mode** for DocumentsUI: an Accessibility service detects the system
-   `PickActivity`, draws a full-screen `TYPE_ACCESSIBILITY_OVERLAY`, lets the user choose
-   a local path, then briefly removes the overlay and drives DocumentsUI to that same
-   target. DocumentsUI remains the hidden backend that issues the real URI grant to the
-   original calling app.
+Then it stops interacting with the picker.
 
-This is a deliberate non-root architecture. It does **not** disable DocumentsUI.
-Disabling DocumentsUI would break SAF instead of creating a true third-party replacement.
+The native DocumentsUI implementation defines this action as last-modified sorting with the newest items first.
 
-## Permissions
+## What it does not do
 
-- Accessibility service: required for automatic system-wide takeover.
-- All files access: required for a full local filesystem browser on Android 11+.
-- No `INTERNET` permission. No telemetry/analytics SDKs.
+- No replacement picker UI
+- No accessibility overlay
+- No status-bar or navigation-bar interception
+- No global navigation actions
+- No storage permissions
+- No file reads or writes
+- No `GET_CONTENT` / `OPEN_DOCUMENT` interception
+- No file provider
+- No network permission
+- No analytics, telemetry, Firebase, or ads
 
-## Current prototype coverage
+## Performance design
 
-- Local shared-storage browsing.
-- Search/filter inside the custom overlay.
-- Direct `GET_CONTENT` selection.
-- Automatic detection of AOSP/Google DocumentsUI picker activity.
-- Open-document handoff through the genuine system picker.
-- Folder-picker handoff (`Use this folder`).
-- Create-document handoff with filename entry.
+The accessibility service is package-scoped to:
 
-## Known prototype limitations
+- `com.google.android.documentsui`
+- `com.android.documentsui`
 
-- Cloud DocumentsProviders are not yet rendered natively in the custom overlay. A future
-  provider bridge can add first-class roots where their APIs permit it.
-- DocumentsUI automation is necessarily OEM/UI-version sensitive; the driver contains
-  text/view-id fallbacks and should be expanded with device-specific adapters.
-- Multi-select handoff is not in the first prototype.
-- Android Photo Picker (`ACTION_PICK_IMAGES`) is a separate system surface and will need
-  its own takeover adapter.
+It uses a zero accessibility notification timeout and first attempts stable native view IDs (`menu_sort` and `menu_sort_date`). Text matching is only a fallback. There is no filesystem scan and no UI rendering. The state machine reacts to DocumentsUI window/content events and uses short retries only if an expected native control has not materialized yet.
 
 ## Build
 
-The included GitHub Actions workflow builds a debug APK on push. Locally:
+GitHub Actions builds the debug APK on every push.
 
 ```bash
 gradle :app:assembleDebug
 ```
 
-Use JDK 17 and Android SDK platform 35.
+Requires JDK 17 and Android SDK platform 35.
