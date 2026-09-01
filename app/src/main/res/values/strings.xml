@@ -1,5 +1,5 @@
 <resources>
     <string name="app_name">Better Picker</string>
-    <string name="accessibility_service_name">Better Picker system takeover</string>
-    <string name="accessibility_service_description">Shows Better Picker whenever Android DocumentsUI opens, then uses the original system picker only as the hidden URI-permission broker.</string>
+    <string name="accessibility_service_name">Better Picker: Modified sort</string>
+    <string name="accessibility_service_description">When Android DocumentsUI opens, automatically selects Sort by → By date modified. No overlay, file access, or system navigation control.</string>
 </resources>
