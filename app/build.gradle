@@ -10,8 +10,10 @@ android {
         applicationId 'com.mekromn.betterpicker'
         minSdk 30
         targetSdk 35
-        versionCode 6
-        versionName '0.2.4'
+        // Reserve a high monotonic range so an accidental low/experimental build can never
+        // block a normal update again. Future releases increment from here only.
+        versionCode 1000000
+        versionName '0.2.5'
     }
 
     signingConfigs {
