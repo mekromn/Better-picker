@@ -11,6 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BETTER_PICKER_CERT_SHA256: 7c92f4984297a336356581d46e1e0674c7117fae800df42257d7823f8998fcaf
+      BETTER_PICKER_PACKAGE: com.mekromn.betterpicker
+      BETTER_PICKER_VERSION_CODE: '1000000'
     steps:
       - uses: actions/checkout@v4
 
@@ -64,6 +66,19 @@ jobs:
 
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
+
+      - name: Verify APK package and version
+        shell: bash
+        run: |
+          AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -n 1)"
+          BADGING="$("$AAPT" dump badging app/build/outputs/apk/debug/app-debug.apk)"
+          echo "$BADGING" | head -n 8
+          PACKAGE="$(printf '%s\n' "$BADGING" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1)"
+          VERSION_CODE="$(printf '%s\n' "$BADGING" | sed -n "s/^package: .*versionCode='\([^']*\)'.*/\1/p" | head -n 1)"
+          echo "APK package: $PACKAGE"
+          echo "APK versionCode: $VERSION_CODE"
+          test "$PACKAGE" = "$BETTER_PICKER_PACKAGE"
+          test "$VERSION_CODE" = "$BETTER_PICKER_VERSION_CODE"
 
       - name: Verify APK signer identity
         shell: bash
